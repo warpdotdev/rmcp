@@ -572,7 +572,7 @@ impl AuthorizationSession {
 
         // try to dynamic register client
         let config = match auth_manager
-            .register_client("MCP Client", redirect_uri)
+            .register_client("Warp", redirect_uri)
             .await
         {
             Ok(config) => config,
