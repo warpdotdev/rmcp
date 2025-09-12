@@ -183,17 +183,35 @@ where
             context: "send initialize request".into(),
         })?;
 
-    let (response, response_id) = expect_response(&mut transport, "initialize response").await?;
+    let initialize_result = loop {
+        match expect_response(&mut transport, "initialize response").await {
+            Ok((ServerResult::InitializeResult(initialize_result), response_id)) => {
+                // Make sure the response id matches the request id.
+                if id != response_id {
+                    return Err(ClientInitializeError::ConflictInitResponseId(
+                        id,
+                        response_id,
+                    ));
+                }
 
-    if id != response_id {
-        return Err(ClientInitializeError::ConflictInitResponseId(
-            id,
-            response_id,
-        ));
-    }
-
-    let ServerResult::InitializeResult(initialize_result) = response else {
-        return Err(ClientInitializeError::ExpectedInitResult(Some(response)));
+                break initialize_result;
+            }
+            // If we get a different result, log it and wait for another response.  The server should not
+            // send messages other than `InitializeResult` during the initialization handshake, but it may
+            // do so anyway.
+            Ok((result, _)) => {
+                let err = ClientInitializeError::ExpectedInitResult(Some(result));
+                tracing::warn!("{err:#}");
+                continue;
+            }
+            // We may get something that isn't a `ServerResult`, e.g.: a notification.  Ignore those too.
+            Err(err @ ClientInitializeError::ExpectedInitResponse(_)) => {
+                tracing::warn!("{err:#}");
+                continue;
+            }
+            // Otherwise, this is a fatal error.
+            Err(err) => Err(err)?,
+        }
     };
 
     // send notification
