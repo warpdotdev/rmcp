@@ -206,46 +206,64 @@ impl AuthorizationManager {
 
     /// discover oauth2 metadata
     pub async fn discover_metadata(&self) -> Result<AuthorizationMetadata, AuthError> {
-        // according to the specification, the metadata should be located at "/.well-known/oauth-authorization-server",
-        // followed by the path of the base url.
-        let discovery_path = format!("/.well-known/oauth-authorization-server{}", self.base_url.path());
+        async fn try_discovery(
+            http_client: &HttpClient,
+            discovery_url: Url,
+        ) -> Result<Option<AuthorizationMetadata>, AuthError> {
+            let response = http_client
+                .get(discovery_url)
+                .header("MCP-Protocol-Version", "2024-11-05")
+                .send()
+                .await?;
+
+            if response.status() == StatusCode::OK {
+                let metadata = response
+                    .json::<AuthorizationMetadata>()
+                    .await
+                    .map_err(|e| {
+                        AuthError::MetadataError(format!("Failed to parse metadata: {}", e))
+                    })?;
+                debug!("metadata: {:?}", metadata);
+                return Ok(Some(metadata));
+            }
+
+            Ok(None)
+        }
 
         let mut discovery_url = self.base_url.clone();
+
+        // according to the specification, the metadata should be located at
+        // "/.well-known/oauth-authorization-server", followed by the path of the base url
+        let discovery_path = format!(
+            "/.well-known/oauth-authorization-server{}",
+            self.base_url.path()
+        );
         discovery_url.set_path(&discovery_path);
-        dbg!(&discovery_url);
-        debug!("discovery url: {:?}", discovery_url);
-        let response = self
-            .http_client
-            .get(discovery_url)
-            .header("MCP-Protocol-Version", "2024-11-05")
-            .send()
-            .await?;
-
-        if response.status() == StatusCode::OK {
-            let metadata = response
-                .json::<AuthorizationMetadata>()
-                .await
-                .map_err(|e| {
-                    AuthError::MetadataError(format!("Failed to parse metadata: {}", e))
-                })?;
-            debug!("metadata: {:?}", metadata);
-            Ok(metadata)
-        } else {
-            // fallback to default endpoints
-            let mut auth_base = self.base_url.clone();
-            // discard the path part, only keep scheme, host, port
-            auth_base.set_path("");
-
-            Ok(AuthorizationMetadata {
-                authorization_endpoint: format!("{}/authorize", auth_base),
-                token_endpoint: format!("{}/token", auth_base),
-                registration_endpoint: format!("{}/register", auth_base),
-                issuer: None,
-                jwks_uri: None,
-                scopes_supported: None,
-                additional_fields: HashMap::new(),
-            })
+        if let Some(metadata) = try_discovery(&self.http_client, discovery_url.clone()).await? {
+            return Ok(metadata);
         }
+
+        // many mcp servers do not follow the spec, and instead expect there to be no
+        // suffix added to the discovery path, so try that too
+        discovery_url.set_path("/.well-known/oauth-authorization-server");
+        if let Some(metadata) = try_discovery(&self.http_client, discovery_url).await? {
+            return Ok(metadata);
+        }
+
+        // fallback to default endpoints
+        let mut auth_base = self.base_url.clone();
+        // discard the path part, only keep scheme, host, port
+        auth_base.set_path("");
+
+        Ok(AuthorizationMetadata {
+            authorization_endpoint: format!("{}/authorize", auth_base),
+            token_endpoint: format!("{}/token", auth_base),
+            registration_endpoint: format!("{}/register", auth_base),
+            issuer: None,
+            jwks_uri: None,
+            scopes_supported: None,
+            additional_fields: HashMap::new(),
+        })
     }
 
     /// get client id and credentials
