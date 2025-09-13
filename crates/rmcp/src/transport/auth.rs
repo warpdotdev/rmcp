@@ -100,6 +100,7 @@ pub enum AuthError {
 pub struct AuthorizationMetadata {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
+    #[serde(default)]
     pub registration_endpoint: String,
     pub issuer: Option<String>,
     pub jwks_uri: Option<String>,
@@ -205,9 +206,13 @@ impl AuthorizationManager {
 
     /// discover oauth2 metadata
     pub async fn discover_metadata(&self) -> Result<AuthorizationMetadata, AuthError> {
-        // according to the specification, the metadata should be located at "/.well-known/oauth-authorization-server"
+        // according to the specification, the metadata should be located at "/.well-known/oauth-authorization-server",
+        // followed by the path of the base url.
+        let discovery_path = format!("/.well-known/oauth-authorization-server{}", self.base_url.path());
+
         let mut discovery_url = self.base_url.clone();
-        discovery_url.set_path("/.well-known/oauth-authorization-server");
+        discovery_url.set_path(&discovery_path);
+        dbg!(&discovery_url);
         debug!("discovery url: {:?}", discovery_url);
         let response = self
             .http_client
