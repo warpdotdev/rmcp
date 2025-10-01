@@ -233,6 +233,7 @@ impl AuthorizationManager {
 
     /// discover oauth2 metadata
     pub async fn discover_metadata(&self) -> Result<AuthorizationMetadata, AuthError> {
+        let mut parse_error = None;
         for candidate_path in
             Self::well_known_paths(self.base_url.path(), "oauth-authorization-server")
         {
@@ -260,16 +261,24 @@ impl AuthorizationManager {
             }
 
             // parse metadata
-            let metadata = response
+            let Ok(metadata) = response
                 .json::<AuthorizationMetadata>()
                 .await
-                .map_err(|e| {
-                    // Fail the discovery if we get a 200 but cannot parse the response
-                    // This indicates a misconfiguration on the server side
-                    AuthError::MetadataError(format!("Failed to parse metadata: {}", e))
-                })?;
+                .inspect_err(|e| {
+                    // Set aside the parsing error for later, but try the next candidate.
+                    parse_error = Some(AuthError::MetadataError(format!("Failed to parse metadata: {:#}", e)));
+                }) else {
+                    // If we get here, we have a 200 but cannot parse the response.  Try the next candidate.
+                    continue;
+                };
             debug!("metadata: {:?}", metadata);
             return Ok(metadata);
+        }
+
+        // If we get here, we have tried all candidates and none worked.  If one returned 200 but we
+        // could not parse the response, return that error.
+        if let Some(e) = parse_error {
+            return Err(e);
         }
 
         debug!("No valid .well-known endpoint found, falling back to default endpoints");
