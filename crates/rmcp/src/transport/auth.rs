@@ -178,6 +178,33 @@ struct AuthorizationState {
 }
 
 impl AuthorizationManager {
+    fn well_known_paths(base_path: &str, resource: &str) -> Vec<String> {
+        let trimmed = base_path.trim_start_matches('/').trim_end_matches('/');
+        let mut candidates = Vec::new();
+
+        let mut push_candidate = |candidate: String| {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        };
+
+        let canonical = format!("/.well-known/{resource}");
+
+        if trimmed.is_empty() {
+            push_candidate(canonical);
+            return candidates;
+        }
+
+        // This follows the RFC 8414 recommendation for well-known URI discovery
+        push_candidate(format!("{canonical}/{trimmed}"));
+        // This is a common pattern used by some identity providers
+        push_candidate(format!("/{trimmed}/.well-known/{resource}"));
+        // The canonical path should always be the last fallback
+        push_candidate(canonical);
+
+        candidates
+    }
+
     /// create new auth manager with base url
     pub async fn new<U: IntoUrl>(base_url: U) -> Result<Self, AuthError> {
         let base_url = base_url.into_url()?;
@@ -206,59 +233,72 @@ impl AuthorizationManager {
 
     /// discover oauth2 metadata
     pub async fn discover_metadata(&self) -> Result<AuthorizationMetadata, AuthError> {
-        async fn try_discovery(
-            http_client: &HttpClient,
-            discovery_url: Url,
-        ) -> Result<Option<AuthorizationMetadata>, AuthError> {
-            let response = http_client
+        let mut parse_error = None;
+        for candidate_path in
+            Self::well_known_paths(self.base_url.path(), "oauth-authorization-server")
+        {
+            let mut discovery_url = self.base_url.clone();
+            discovery_url.set_path(&candidate_path);
+            debug!("discovery url: {:?}", discovery_url);
+
+            let response = match self
+                .http_client
                 .get(discovery_url)
                 .header("MCP-Protocol-Version", "2024-11-05")
                 .send()
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("discovery request failed: {}", e);
+                    continue; // try next candidate if request fails
+                }
+            };
 
-            if response.status() == StatusCode::OK {
-                let metadata = response
-                    .json::<AuthorizationMetadata>()
-                    .await
-                    .map_err(|e| {
-                        AuthError::MetadataError(format!("Failed to parse metadata: {}", e))
-                    })?;
-                debug!("metadata: {:?}", metadata);
-                return Ok(Some(metadata));
+            if response.status() != StatusCode::OK {
+                debug!("discovery returned non-200: {}", response.status());
+                continue; // try next candidate if response is not OK
             }
 
-            Ok(None)
-        }
-
-        let mut discovery_url = self.base_url.clone();
-
-        // according to the specification, the metadata should be located at
-        // "/.well-known/oauth-authorization-server", followed by the path of the base url
-        let discovery_path = format!(
-            "/.well-known/oauth-authorization-server{}",
-            self.base_url.path()
-        );
-        discovery_url.set_path(&discovery_path);
-        if let Some(metadata) = try_discovery(&self.http_client, discovery_url.clone()).await? {
+            // parse metadata
+            let Ok(metadata) = response
+                .json::<AuthorizationMetadata>()
+                .await
+                .inspect_err(|e| {
+                    // Set aside the parsing error for later, but try the next candidate.
+                    parse_error = Some(AuthError::MetadataError(format!("Failed to parse metadata: {:#}", e)));
+                }) else {
+                    // If we get here, we have a 200 but cannot parse the response.  Try the next candidate.
+                    continue;
+                };
+            debug!("metadata: {:?}", metadata);
             return Ok(metadata);
         }
 
-        // many mcp servers do not follow the spec, and instead expect there to be no
-        // suffix added to the discovery path, so try that too
-        discovery_url.set_path("/.well-known/oauth-authorization-server");
-        if let Some(metadata) = try_discovery(&self.http_client, discovery_url).await? {
-            return Ok(metadata);
+        // If we get here, we have tried all candidates and none worked.  If one returned 200 but we
+        // could not parse the response, return that error.
+        if let Some(e) = parse_error {
+            return Err(e);
         }
+
+        debug!("No valid .well-known endpoint found, falling back to default endpoints");
 
         // fallback to default endpoints
         let mut auth_base = self.base_url.clone();
         // discard the path part, only keep scheme, host, port
         auth_base.set_path("");
 
+        // Helper function to create endpoint URL
+        let create_endpoint = |path: &str| -> String {
+            let mut url = auth_base.clone();
+            url.set_path(path);
+            url.to_string()
+        };
+
         Ok(AuthorizationMetadata {
-            authorization_endpoint: format!("{}/authorize", auth_base),
-            token_endpoint: format!("{}/token", auth_base),
-            registration_endpoint: format!("{}/register", auth_base),
+            authorization_endpoint: create_endpoint("authorize"),
+            token_endpoint: create_endpoint("token"),
+            registration_endpoint: create_endpoint("register"),
             issuer: None,
             jwks_uri: None,
             scopes_supported: None,
