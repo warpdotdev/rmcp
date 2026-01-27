@@ -103,7 +103,7 @@ impl<E: std::error::Error + Send> SseStreamReconnect for NeverReconnect<E> {
 /// frames (e.g. `event: endpoint`) that arrive when a server restarts an SSE
 /// stream. The default implementation is a no-op, keeping existing behaviour
 /// intact.
-pub(crate) trait SseStreamReconnect {
+pub trait SseStreamReconnect {
     type Error: std::error::Error;
     type Future: Future<Output = Result<BoxedSseResponse, Self::Error>> + Send;
     fn retry_connection(&mut self, last_event_id: Option<&str>) -> Self::Future;
@@ -124,7 +124,7 @@ pub(crate) trait SseStreamReconnect {
 }
 
 pin_project_lite::pin_project! {
-    pub(crate) struct SseAutoReconnectStream<R>
+    pub struct SseAutoReconnectStream<R>
     where R: SseStreamReconnect
      {
         retry_policy: Arc<dyn SseRetryPolicy>,
