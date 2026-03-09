@@ -95,12 +95,15 @@ cargo run --example oauth-client
 
 ## Authorization Flow Description
 
-1. **Metadata Discovery**: Client attempts to get authorization server metadata from `/.well-known/oauth-authorization-server`
-2. **Client Registration**: If supported, client dynamically registers itself
-3. **Authorization Request**: Build authorization URL with PKCE and guide user to access
-4. **Authorization Code Exchange**: After user authorization, exchange authorization code for access token
-5. **Token Usage**: Use access token for API calls
-6. **Token Refresh**: Automatically use refresh token to get new access token when current one expires
+1. **Resource Metadata Discovery**: Client probes the server and extracts `WWW-Authenticate` parameters including `resource_metadata` URL and `scope`
+2. **Protected Resource Metadata**: Client fetches resource server metadata (RFC 9728) to find authorization server(s) and supported scopes
+3. **AS Metadata Discovery**: Client discovers authorization server metadata via RFC 8414 and OpenID Connect well-known endpoints
+4. **Client Registration**: If supported, client dynamically registers itself (or uses URL-based Client ID via SEP-991)
+5. **Scope Selection**: SDK picks scopes from WWW-Authenticate > PRM > AS metadata > caller defaults
+6. **Authorization Request**: Build authorization URL with PKCE (S256) and RFC 8707 resource parameter
+7. **Authorization Code Exchange**: After user authorization, exchange code for access token (with resource parameter)
+8. **Token Usage**: Use access token for API calls via `AuthClient` or `AuthorizedHttpClient`
+9. **Token Refresh**: Automatically use refresh token to get new access token when current one expires; previously granted scopes are forwarded in the refresh request so providers that require them (e.g. Azure AD v2) work correctly
 
 ## Security Considerations
 
@@ -123,4 +126,8 @@ If you encounter authorization issues, check the following:
 - [MCP Authorization Specification](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/authorization/)
 - [OAuth 2.1 Specification Draft](https://oauth.net/2.1/)
 - [RFC 8414: OAuth 2.0 Authorization Server Metadata](https://datatracker.ietf.org/doc/html/rfc8414)
-- [RFC 7591: OAuth 2.0 Dynamic Client Registration Protocol](https://datatracker.ietf.org/doc/html/rfc7591) 
+- [RFC 7591: OAuth 2.0 Dynamic Client Registration Protocol](https://datatracker.ietf.org/doc/html/rfc7591)
+- [RFC 8707: Resource Indicators for OAuth 2.0](https://datatracker.ietf.org/doc/html/rfc8707)
+- [RFC 9728: OAuth 2.0 Protected Resource Metadata](https://datatracker.ietf.org/doc/html/rfc9728)
+- [RFC 7636: Proof Key for Code Exchange (PKCE)](https://datatracker.ietf.org/doc/html/rfc7636)
+- [RFC 6749 §6: Refreshing an Access Token](https://www.rfc-editor.org/rfc/rfc6749#section-6)
