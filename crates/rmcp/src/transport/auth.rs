@@ -18,7 +18,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 const DEFAULT_EXCHANGE_URL: &str = "http://localhost";
 

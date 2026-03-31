@@ -349,7 +349,7 @@ impl<T: DeserializeOwned> Decoder for JsonRpcMessageCodec<T> {
                     let item = match try_parse_with_compatibility(line, "decode") {
                         Ok(Some(item)) => item,
                         Ok(None) => return Ok(None), // Skip non-standard message
-                        Err(_e) => {
+                        Err(e) => {
                             // Ignore lines that do not parse
                             continue;
                         },
