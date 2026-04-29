@@ -612,9 +612,15 @@ impl AuthorizationManager {
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
         // build authorization request
+        //
+        // RFC 8707 (Resource Indicators for OAuth 2.0): include the resource
+        // server's URL as the `resource` parameter so that the authorization
+        // server can audience-bind the issued access token. Some IdPs (e.g.
+        // Natoma) reject /authorize calls that omit this parameter.
         let mut auth_request = oauth_client
             .authorize_url(CsrfToken::new_random)
-            .set_pkce_challenge(pkce_challenge);
+            .set_pkce_challenge(pkce_challenge)
+            .add_extra_param("resource", self.base_url.to_string());
 
         // add request scopes
         for scope in scopes {
@@ -663,9 +669,15 @@ impl AuthorizationManager {
         debug!("client_id: {:?}", oauth_client.client_id());
 
         // exchange token
+        //
+        // RFC 8707 (Resource Indicators for OAuth 2.0): forward the resource
+        // server URL to the token endpoint as well, mirroring what was sent
+        // on the /authorize request. Authorization servers that enforce
+        // resource indicators will reject token exchanges otherwise.
         let token_result = match oauth_client
             .exchange_code(AuthorizationCode::new(code.to_string()))
             .set_pkce_verifier(pkce_verifier)
+            .add_extra_param("resource", self.base_url.to_string())
             .request_async(&http_client)
             .await
         {
@@ -1455,8 +1467,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        AuthError, AuthorizationManager, InMemoryStateStore, StateStore, StoredAuthorizationState,
-        is_https_url,
+        AuthError, AuthorizationManager, AuthorizationMetadata, InMemoryStateStore,
+        OAuthClientConfig, StateStore, StoredAuthorizationState, is_https_url,
     };
 
     // SEP-991: URL-based Client IDs
@@ -1481,6 +1493,41 @@ mod tests {
         assert!(!is_https_url("javascript:alert(1)"));
         // Returns false for data scheme
         assert!(!is_https_url("data:text/html,<script>alert(1)</script>"));
+    }
+
+    /// RFC 8707: the authorization URL must include the `resource` parameter
+    /// pointing at the resource server (the manager's `base_url`). Without it,
+    /// authorization servers like Natoma reject the /authorize call with
+    /// `invalid_request`.
+    #[tokio::test]
+    async fn authorize_url_includes_rfc8707_resource_parameter() {
+        let base = "https://mcp.example.com/v1/sse";
+        let mut manager = AuthorizationManager::new(base).await.unwrap();
+        manager.set_metadata(AuthorizationMetadata {
+            authorization_endpoint: "https://auth.example.com/authorize".to_string(),
+            token_endpoint: "https://auth.example.com/token".to_string(),
+            ..Default::default()
+        });
+        manager
+            .configure_client(OAuthClientConfig {
+                client_id: "test-client".to_string(),
+                client_secret: None,
+                scopes: vec![],
+                redirect_uri: "warp://mcp/oauth2callback".to_string(),
+            })
+            .unwrap();
+
+        let auth_url = manager.get_authorization_url(&[]).await.unwrap();
+        let parsed = Url::parse(&auth_url).unwrap();
+        let resource = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "resource")
+            .map(|(_, v)| v.into_owned());
+        assert_eq!(
+            resource.as_deref(),
+            Some(base),
+            "authorize URL must include resource={base}, got: {auth_url}"
+        );
     }
 
     #[test]
