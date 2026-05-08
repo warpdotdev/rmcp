@@ -1446,73 +1446,80 @@ impl AuthorizationManager {
     async fn discover_oauth_server_via_resource_metadata(
         &self,
     ) -> Result<Option<AuthorizationMetadata>, AuthError> {
-        let Some(resource_metadata_url) = self.discover_resource_metadata_url().await? else {
-            return Ok(None);
-        };
+        let prm_urls = self.discover_resource_metadata_urls().await?;
 
-        let Some(resource_metadata) = self
-            .fetch_resource_metadata_from_url(&resource_metadata_url)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        // store scopes_supported from protected resource metadata for select_scopes()
-        if let Some(scopes) = resource_metadata.scopes_supported {
-            if !scopes.is_empty() {
-                *self.resource_scopes.write().await = scopes;
-            }
-        }
-
-        let mut candidates = Vec::new();
-
-        if let Some(single) = resource_metadata.authorization_server {
-            candidates.push(single);
-        }
-        if let Some(list) = resource_metadata.authorization_servers {
-            candidates.extend(list);
-        }
-
-        for candidate in candidates {
-            let candidate = candidate.trim();
-            if candidate.is_empty() {
+        for prm_url in &prm_urls {
+            let Some(resource_metadata) = self.fetch_resource_metadata_from_url(prm_url).await?
+            else {
                 continue;
-            }
-
-            let candidate_url = match Url::parse(candidate) {
-                Ok(url) => url,
-                Err(_) => match resource_metadata_url.join(candidate) {
-                    Ok(url) => url,
-                    Err(e) => {
-                        debug!("Failed to resolve authorization server URL `{candidate}`: {e}");
-                        continue;
-                    }
-                },
             };
 
-            if candidate_url.path().contains("/.well-known/") {
-                if let Some(metadata) = self.fetch_authorization_metadata(&candidate_url).await? {
-                    return Ok(Some(metadata));
+            // Store scopes_supported from protected resource metadata for select_scopes().
+            if let Some(scopes) = resource_metadata.scopes_supported {
+                if !scopes.is_empty() {
+                    *self.resource_scopes.write().await = scopes;
                 }
-                continue;
             }
 
-            if let Some(metadata) = self.try_discover_oauth_server(&candidate_url).await? {
-                return Ok(Some(metadata));
+            let mut candidates = Vec::new();
+
+            if let Some(single) = resource_metadata.authorization_server {
+                candidates.push(single);
+            }
+            if let Some(list) = resource_metadata.authorization_servers {
+                candidates.extend(list);
+            }
+
+            for candidate in candidates {
+                let candidate = candidate.trim();
+                if candidate.is_empty() {
+                    continue;
+                }
+
+                let candidate_url = match Url::parse(candidate) {
+                    Ok(url) => url,
+                    Err(_) => match prm_url.join(candidate) {
+                        Ok(url) => url,
+                        Err(e) => {
+                            debug!("Failed to resolve authorization server URL `{candidate}`: {e}");
+                            continue;
+                        }
+                    },
+                };
+
+                if candidate_url.path().contains("/.well-known/") {
+                    if let Some(metadata) =
+                        self.fetch_authorization_metadata(&candidate_url).await?
+                    {
+                        return Ok(Some(metadata));
+                    }
+                    continue;
+                }
+
+                if let Some(metadata) = self.try_discover_oauth_server(&candidate_url).await? {
+                    return Ok(Some(metadata));
+                }
             }
         }
 
         Ok(None)
     }
 
-    async fn discover_resource_metadata_url(&self) -> Result<Option<Url>, AuthError> {
-        if let Ok(Some(resource_metadata_url)) =
-            self.fetch_resource_metadata_url(&self.base_url).await
+    /// Collect all candidate PRM URLs: first from WWW-Authenticate headers on the
+    /// base URL (which may list multiple resource_metadata values), then from
+    /// well-known path probing as a fallback.
+    async fn discover_resource_metadata_urls(&self) -> Result<Vec<Url>, AuthError> {
+        let mut candidates = Vec::new();
+
+        // Try the base URL first — extract all resource_metadata URLs from WWW-Authenticate.
+        if let Ok(urls) = self
+            .extract_resource_metadata_urls_from_probe(&self.base_url)
+            .await
         {
-            return Ok(Some(resource_metadata_url));
+            candidates.extend(urls);
         }
 
-        // If the primary URL doesn't use WWW-Authenticate, try oauth-protected-resource discovery.
+        // Also try well-known paths as fallback candidates.
         // https://www.rfc-editor.org/rfc/rfc9728.html#name-obtaining-protected-resourc
         for candidate_path in
             Self::well_known_paths(self.base_url.path(), "oauth-protected-resource")
@@ -1521,19 +1528,31 @@ impl AuthorizationManager {
             discovery_url.set_query(None);
             discovery_url.set_fragment(None);
             discovery_url.set_path(&candidate_path);
-            if let Ok(Some(resource_metadata_url)) =
-                self.fetch_resource_metadata_url(&discovery_url).await
-            {
-                return Ok(Some(resource_metadata_url));
+            if !candidates.contains(&discovery_url) {
+                if let Ok(urls) = self
+                    .extract_resource_metadata_urls_from_probe(&discovery_url)
+                    .await
+                {
+                    for url in urls {
+                        if !candidates.contains(&url) {
+                            candidates.push(url);
+                        }
+                    }
+                }
             }
         }
 
-        Ok(None)
+        Ok(candidates)
     }
 
-    /// Extract the resource metadata url from the WWW-Authenticate header value.
-    /// https://www.rfc-editor.org/rfc/rfc9728.html#name-use-of-www-authenticate-for
-    async fn fetch_resource_metadata_url(&self, url: &Url) -> Result<Option<Url>, AuthError> {
+    /// Probe a URL and extract all resource_metadata URLs from its response.
+    /// If the response is 200 OK, the URL itself is a PRM endpoint.
+    /// If the response is 401, all resource_metadata values from WWW-Authenticate headers
+    /// are collected.
+    async fn extract_resource_metadata_urls_from_probe(
+        &self,
+        url: &Url,
+    ) -> Result<Vec<Url>, AuthError> {
         let response = match self
             .http_client
             .get(url.clone())
@@ -1544,39 +1563,71 @@ impl AuthorizationManager {
             Ok(r) => r,
             Err(e) => {
                 debug!("resource metadata probe failed: {}", e);
-                return Ok(None);
+                return Ok(vec![]);
             }
         };
 
         if response.status() == StatusCode::OK {
-            return Ok(Some(url.clone()));
+            return Ok(vec![url.clone()]);
         } else if response.status() != StatusCode::UNAUTHORIZED {
             debug!(
                 "resource metadata probe returned unexpected status: {}",
                 response.status()
             );
-            return Ok(None);
+            return Ok(vec![]);
         }
 
-        let mut parsed_url = None;
+        let mut urls = Vec::new();
         for value in response.headers().get_all(WWW_AUTHENTICATE).iter() {
             let Ok(value_str) = value.to_str() else {
                 continue;
             };
+            // Store scopes from the WWW-Authenticate header if present.
             let params = Self::extract_www_authenticate_params(value_str, &self.base_url);
-            if let Some(url) = params.resource_metadata_url {
-                if let Some(scope) = &params.scope {
-                    debug!("WWW-Authenticate header contains scope: {}", scope);
-                    let scopes: Vec<String> =
-                        scope.split_whitespace().map(|s| s.to_string()).collect();
-                    *self.www_auth_scopes.write().await = scopes;
+            if let Some(scope) = &params.scope {
+                debug!("WWW-Authenticate header contains scope: {}", scope);
+                let scopes: Vec<String> = scope.split_whitespace().map(|s| s.to_string()).collect();
+                *self.www_auth_scopes.write().await = scopes;
+            }
+            // Collect ALL resource_metadata URLs from this header value.
+            let extracted = Self::extract_all_resource_metadata_urls(value_str, &self.base_url);
+            for u in extracted {
+                if !urls.contains(&u) {
+                    urls.push(u);
                 }
-                parsed_url = Some(url);
+            }
+        }
+
+        Ok(urls)
+    }
+
+    /// Extract all `resource_metadata` URLs from a single WWW-Authenticate header value.
+    /// Unlike `extract_www_authenticate_params` which returns only the first match,
+    /// this collects every occurrence.
+    fn extract_all_resource_metadata_urls(header: &str, base_url: &Url) -> Vec<Url> {
+        let header_lowercase = header.to_ascii_lowercase();
+        let resource_key = "resource_metadata=";
+        let mut urls = Vec::new();
+        let mut search_offset = 0;
+
+        while let Some(pos) = header_lowercase[search_offset..].find(resource_key) {
+            let global_pos = search_offset + pos + resource_key.len();
+            let value_slice = &header[global_pos..];
+            if let Some((value, consumed)) = Self::parse_next_header_value(value_slice) {
+                if let Ok(url) = Url::parse(&value) {
+                    urls.push(url);
+                } else if let Ok(url) = base_url.join(&value) {
+                    urls.push(url);
+                } else {
+                    debug!("failed to parse resource metadata value `{value}` as URL");
+                }
+                search_offset = global_pos + consumed;
+            } else {
                 break;
             }
         }
 
-        Ok(parsed_url)
+        urls
     }
 
     async fn fetch_resource_metadata_from_url(
