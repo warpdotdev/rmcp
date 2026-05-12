@@ -1633,15 +1633,12 @@ impl AuthorizationManager {
             if let Some((value, consumed)) = Self::parse_next_header_value(value_slice) {
                 if let Ok(url) = Url::parse(&value) {
                     params.resource_metadata_url = Some(url);
-                    break;
-                }
-                if let Ok(url) = base_url.join(&value) {
+                } else if let Ok(url) = base_url.join(&value) {
                     params.resource_metadata_url = Some(url);
-                    break;
+                } else {
+                    debug!("failed to parse resource metadata value `{value}` as URL");
                 }
-                debug!("failed to parse resource metadata value `{value}` as URL");
                 search_offset = global_pos + consumed;
-                continue;
             } else {
                 break;
             }
@@ -2870,6 +2867,17 @@ mod tests {
         assert!(params.is_invalid_token());
         assert!(!params.is_insufficient_scope());
         assert!(params.error_description.is_none());
+    }
+
+    #[test]
+    fn extract_www_authenticate_duplicate_resource_metadata_uses_last_value() {
+        let header = r#"Bearer resource_metadata="https://example.com/.well-known/first", resource_metadata="https://example.com/.well-known/second""#;
+        let base = Url::parse("https://example.com/api").unwrap();
+        let params = AuthorizationManager::extract_www_authenticate_params(header, &base);
+        assert_eq!(
+            params.resource_metadata_url.unwrap().as_str(),
+            "https://example.com/.well-known/second"
+        );
     }
 
     #[test]
